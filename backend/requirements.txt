@@ -21,5 +21,6 @@ pydantic
 pydantic-settings
 langchain-text-splitters
 langchain-community
+pymupdf
 
 
