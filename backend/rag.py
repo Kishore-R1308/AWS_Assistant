@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import CHROMA_PATH
+from backend.config import CHROMA_PATH
 
 
 COLLECTION_NAME = "aws_knowledge_v2"
