@@ -15,7 +15,9 @@ from langchain_core.documents import Document
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAG_DIRECTORY = PROJECT_ROOT / "rag_data"
 
+# Make backend package available
 sys.path.insert(0, str(PROJECT_ROOT))
+
 
 from backend.rag import add_documents
 
@@ -24,13 +26,19 @@ from backend.rag import add_documents
 # CONFIGURATION
 # ============================================================
 
-SUPPORTED_EXTENSIONS = {".pdf"}
+SUPPORTED_EXTENSIONS = {
+    ".pdf",
+}
 
-# Number of PDF pages kept in memory at once
+# Number of pages kept in memory before sending them to Chroma
 PAGE_BATCH_SIZE = 25
 
-# Embedding batch size
+# Number of chunks embedded at once
 EMBEDDING_BATCH_SIZE = 32
+
+# Maximum number of pages processed from each PDF.
+# This keeps Railway resource usage manageable.
+MAX_PAGES_PER_PDF = 300
 
 
 # ============================================================
@@ -38,15 +46,34 @@ EMBEDDING_BATCH_SIZE = 32
 # ============================================================
 
 def clean_text(text: str) -> str:
+    """
+    Clean extracted PDF text while preserving useful
+    paragraph and line boundaries.
+    """
+
     if not text:
         return ""
 
+    # Remove null characters
     text = text.replace("\x00", " ")
+
+    # Normalize line endings
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
 
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Remove excessive spaces/tabs
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    # Remove excessive blank lines
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
 
     return text.strip()
 
@@ -56,6 +83,15 @@ def clean_text(text: str) -> str:
 # ============================================================
 
 def ingest_pdf(pdf_path: Path) -> int:
+    """
+    Process one PDF incrementally.
+
+    Important:
+    We use lazy_load() instead of load() so that the entire
+    PDF is NOT loaded into memory.
+
+    Only PAGE_BATCH_SIZE pages are kept in memory at once.
+    """
 
     print()
     print("=" * 70)
@@ -63,33 +99,77 @@ def ingest_pdf(pdf_path: Path) -> int:
     print("=" * 70)
 
     try:
-        loader = PyMuPDFLoader(str(pdf_path))
+        loader = PyMuPDFLoader(
+            str(pdf_path)
+        )
+
     except Exception as exc:
-        print(f"ERROR creating loader: {exc}")
+        print(
+            f"ERROR creating PDF loader: {exc}"
+        )
         return 0
 
-    batch: list[Document] = []
+    page_batch: list[Document] = []
+
     total_pages = 0
     total_chunks = 0
 
     try:
-        # IMPORTANT:
-        # lazy_load() processes pages one at a time.
-        for index, page_document in enumerate(loader.lazy_load()):
+
+        # Process PDF page-by-page
+        for index, page_document in enumerate(
+            loader.lazy_load()
+        ):
+
+            # Stop after MAX_PAGES_PER_PDF
+            if index >= MAX_PAGES_PER_PDF:
+
+                print()
+                print(
+                    f"Reached page limit of "
+                    f"{MAX_PAGES_PER_PDF} "
+                    f"for {pdf_path.name}"
+                )
+
+                break
 
             total_pages += 1
 
-            text = clean_text(page_document.page_content)
+            # ------------------------------------------------
+            # Clean text
+            # ------------------------------------------------
 
+            text = clean_text(
+                page_document.page_content
+            )
+
+            # Skip empty pages
             if not text:
                 continue
 
-            original_page = page_document.metadata.get("page")
+            # ------------------------------------------------
+            # Page number
+            # ------------------------------------------------
+
+            original_page = (
+                page_document.metadata.get(
+                    "page"
+                )
+            )
 
             if original_page is not None:
-                page_number = int(original_page) + 1
+
+                page_number = (
+                    int(original_page) + 1
+                )
+
             else:
+
                 page_number = total_pages
+
+            # ------------------------------------------------
+            # Metadata
+            # ------------------------------------------------
 
             metadata = {
                 "source": pdf_path.name,
@@ -99,87 +179,123 @@ def ingest_pdf(pdf_path: Path) -> int:
                 "file_type": "pdf",
             }
 
-            batch.append(
+            # ------------------------------------------------
+            # Create document
+            # ------------------------------------------------
+
+            page_batch.append(
                 Document(
                     page_content=text,
                     metadata=metadata,
                 )
             )
 
+            # ------------------------------------------------
+            # Progress
+            # ------------------------------------------------
+
             if total_pages % 100 == 0:
+
                 print(
-                    f"  Processed pages: "
-                    f"{total_pages}"
+                    f"Processed pages: "
+                    f"{total_pages}/"
+                    f"{MAX_PAGES_PER_PDF}"
                 )
 
-            # Send a small batch to Chroma
-            if len(batch) >= PAGE_BATCH_SIZE:
+            # ------------------------------------------------
+            # Send batch to Chroma
+            # ------------------------------------------------
 
-                chunks = add_documents(
-                    batch,
+            if len(page_batch) >= PAGE_BATCH_SIZE:
+
+                chunks_indexed = add_documents(
+                    page_batch,
                     batch_size=EMBEDDING_BATCH_SIZE,
                 )
 
-                total_chunks += chunks
+                total_chunks += chunks_indexed
 
                 print(
-                    f"  Indexed pages through "
+                    f"Indexed pages through "
                     f"{total_pages} | "
-                    f"Total chunks: {total_chunks}"
+                    f"Total chunks: "
+                    f"{total_chunks}"
                 )
 
                 # Release memory
-                batch.clear()
+                page_batch.clear()
 
+        # ----------------------------------------------------
         # Process remaining pages
-        if batch:
+        # ----------------------------------------------------
 
-            chunks = add_documents(
-                batch,
+        if page_batch:
+
+            chunks_indexed = add_documents(
+                page_batch,
                 batch_size=EMBEDDING_BATCH_SIZE,
             )
 
-            total_chunks += chunks
-            batch.clear()
+            total_chunks += chunks_indexed
+
+            page_batch.clear()
+
+        print()
+        print("=" * 70)
+        print(
+            f"Finished: {pdf_path.name}"
+        )
+        print(
+            f"Pages processed: {total_pages}"
+        )
+        print(
+            f"Chunks indexed: {total_chunks}"
+        )
+        print("=" * 70)
 
     except Exception as exc:
 
         print()
         print("=" * 70)
-        print("ERROR DURING PDF INGESTION")
+        print(
+            "ERROR DURING PDF INGESTION"
+        )
         print("=" * 70)
-        print(f"PDF: {pdf_path.name}")
-        print(f"Error: {exc}")
-        raise
 
-    print()
-    print(
-        f"Finished {pdf_path.name}: "
-        f"{total_pages} pages, "
-        f"{total_chunks} chunks"
-    )
+        print(
+            f"PDF: {pdf_path.name}"
+        )
+
+        print(
+            f"Error: {exc}"
+        )
+
+        raise
 
     return total_chunks
 
 
 # ============================================================
-# MAIN
+# FIND PDFs
 # ============================================================
 
-def main() -> None:
-
-    print()
-    print("=" * 70)
-    print("AWS MONITORING AGENT - RAG INGESTION")
-    print("=" * 70)
-
-    print(f"Project root: {PROJECT_ROOT}")
-    print(f"Knowledge directory: {RAG_DIRECTORY}")
+def find_pdf_files() -> list[Path]:
+    """
+    Find all PDF files in rag_data.
+    """
 
     if not RAG_DIRECTORY.exists():
-        raise FileNotFoundError(
-            f"RAG directory does not exist: {RAG_DIRECTORY}"
+
+        print()
+        print(
+            "ERROR: RAG directory does not exist:"
         )
+
+        print(
+            RAG_DIRECTORY
+        )
+
+        return []
 
     pdf_files = sorted(
         [
@@ -193,39 +309,132 @@ def main() -> None:
         ]
     )
 
+    return pdf_files
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+
+    print()
+    print("=" * 70)
+    print(
+        "AWS MONITORING AGENT - RAG INGESTION"
+    )
+    print("=" * 70)
+
+    print(
+        f"Project root: {PROJECT_ROOT}"
+    )
+
+    print(
+        f"Knowledge directory: "
+        f"{RAG_DIRECTORY}"
+    )
+
+    print(
+        f"Maximum pages per PDF: "
+        f"{MAX_PAGES_PER_PDF}"
+    )
+
+    print(
+        f"Page batch size: "
+        f"{PAGE_BATCH_SIZE}"
+    )
+
+    print(
+        f"Embedding batch size: "
+        f"{EMBEDDING_BATCH_SIZE}"
+    )
+
+    # --------------------------------------------------------
+    # Find PDFs
+    # --------------------------------------------------------
+
+    pdf_files = find_pdf_files()
+
     if not pdf_files:
-        raise FileNotFoundError(
-            f"No PDF files found in {RAG_DIRECTORY}"
+
+        print()
+        print(
+            "ERROR: No PDF files found."
         )
+
+        print(
+            "Place PDFs inside:"
+        )
+
+        print(
+            RAG_DIRECTORY
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Display PDFs
+    # --------------------------------------------------------
 
     print()
     print("=" * 70)
     print("PDF FILES FOUND")
     print("=" * 70)
 
-    for index, pdf in enumerate(pdf_files, start=1):
-        print(f"{index}. {pdf.name}")
+    for index, pdf in enumerate(
+        pdf_files,
+        start=1,
+    ):
+
+        print(
+            f"{index}. {pdf.name}"
+        )
+
+    # --------------------------------------------------------
+    # Process PDFs ONE AT A TIME
+    # --------------------------------------------------------
 
     total_chunks = 0
 
-    # Process ONE PDF at a time
     for pdf_path in pdf_files:
 
-        chunks = ingest_pdf(pdf_path)
+        chunks = ingest_pdf(
+            pdf_path
+        )
 
         total_chunks += chunks
 
-    print()
-    print("=" * 70)
-    print("RAG INDEXING COMPLETE")
-    print("=" * 70)
-
-    print(f"PDFs processed: {len(pdf_files)}")
-    print(f"Total chunks indexed: {total_chunks}")
+    # --------------------------------------------------------
+    # Complete
+    # --------------------------------------------------------
 
     print()
-    print("All documents are now available in ChromaDB.")
+    print("=" * 70)
+    print(
+        "RAG INDEXING COMPLETE"
+    )
+    print("=" * 70)
 
+    print(
+        f"PDFs processed: "
+        f"{len(pdf_files)}"
+    )
+
+    print(
+        f"Total chunks indexed: "
+        f"{total_chunks}"
+    )
+
+    print()
+    print(
+        "Documents are now available "
+        "in ChromaDB."
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
