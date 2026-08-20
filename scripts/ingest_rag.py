@@ -38,6 +38,7 @@ EMBEDDING_BATCH_SIZE = 32
 
 # Maximum number of pages processed from each PDF.
 # This keeps Railway resource usage manageable.
+START_PAGE = 1
 MAX_PAGES_PER_PDF = 300
 
 
