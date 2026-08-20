@@ -3,7 +3,7 @@ import uuid
 import requests
 import streamlit as st
 
-BACKEND_URL = "http://127.0.0.1:8000"
+BACKEND_URL = "https://awsassistant-production.up.railway.app"
 
 st.set_page_config(
     page_title="AWS AI Agent",
