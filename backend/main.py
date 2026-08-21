@@ -4,11 +4,11 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
-from agent import run_agent
-from aws_auth import connect_aws
-from database import Base, engine, get_db
-from models import ChatMessage
-from schemas import (
+from backend.agent import run_agent
+from backend.aws_auth import connect_aws
+from backend.database import Base, engine, get_db
+from backend.models import ChatMessage
+from backend.schemas import (
     AWSConnectRequest,
     AWSConnectResponse,
     ChatRequest,
