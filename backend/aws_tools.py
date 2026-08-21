@@ -1,4 +1,4 @@
-from aws_auth import get_aws_client
+from backend.aws_auth import get_aws_client
 
 
 def get_ec2_instances(session_id):

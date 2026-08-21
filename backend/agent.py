@@ -1,10 +1,12 @@
 import json
+
 from typing import TypedDict
 
 from langchain_groq import ChatGroq
+
 from langgraph.graph import END, START, StateGraph
 
-from aws_tools import (
+from backend.aws_tools import (
     get_ec2_instances,
     get_rds_instances,
     get_s3_buckets,
@@ -16,9 +18,8 @@ from aws_tools import (
     get_vpc_security_groups,
 )
 
-from config import GROQ_API_KEY, GROQ_MODEL
-from rag import retrieve_context
-
+from backend.config import GROQ_API_KEY, GROQ_MODEL
+from backend.rag import retrieve_context
 
 class AgentState(TypedDict, total=False):
     session_id: str
