@@ -1,47 +1,90 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
-from pathlib import Path
 from typing import Iterable
 
-from langchain_chroma import Chroma
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    PointStruct,
+    VectorParams,
+)
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from backend.config import CHROMA_PATH
+
+# ============================================================
+# QDRANT CONFIGURATION
+# ============================================================
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+COLLECTION_NAME = os.getenv(
+    "QDRANT_COLLECTION",
+    "aws_knowledge",
+)
+
+EMBEDDING_MODEL = (
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+VECTOR_SIZE = 384
 
 
-COLLECTION_NAME = "aws_knowledge_v2"
+# ============================================================
+# RAG CONFIGURATION
+# ============================================================
 
-# Chunk configuration
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 180
 
-# Retrieval configuration
 DEFAULT_RETRIEVAL_K = 8
-FETCH_K = 30
 
+
+# ============================================================
+# GLOBAL OBJECTS
+# ============================================================
 
 _embeddings = None
-_vectorstore = None
+_qdrant = None
 _splitter = None
 
+
+# ============================================================
+# VALIDATE QDRANT CONFIG
+# ============================================================
+
+def validate_qdrant_config():
+    if not QDRANT_URL:
+        raise RuntimeError(
+            "QDRANT_URL environment variable is not configured."
+        )
+
+    if not QDRANT_API_KEY:
+        raise RuntimeError(
+            "QDRANT_API_KEY environment variable is not configured."
+        )
+
+
+# ============================================================
+# EMBEDDINGS
+# ============================================================
 
 def get_embeddings():
     """
     Load the embedding model only once.
-
-    all-MiniLM-L6-v2 is lightweight and suitable for a local
-    prototype. It avoids sending document contents to an external
-    embedding API.
     """
+
     global _embeddings
 
     if _embeddings is None:
+
         _embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_name=EMBEDDING_MODEL,
             model_kwargs={
                 "device": "cpu",
             },
@@ -54,10 +97,65 @@ def get_embeddings():
     return _embeddings
 
 
+# ============================================================
+# QDRANT CLIENT
+# ============================================================
+
+def get_qdrant():
+
+    global _qdrant
+
+    if _qdrant is None:
+
+        validate_qdrant_config()
+
+        _qdrant = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY,
+        )
+
+    return _qdrant
+
+
+# ============================================================
+# CREATE / VERIFY COLLECTION
+# ============================================================
+
+def ensure_collection():
+
+    client = get_qdrant()
+
+    collections = (
+        client.get_collections()
+        .collections
+    )
+
+    collection_names = [
+        collection.name
+        for collection in collections
+    ]
+
+    if COLLECTION_NAME not in collection_names:
+
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(
+                size=VECTOR_SIZE,
+                distance=Distance.COSINE,
+            ),
+        )
+
+
+# ============================================================
+# TEXT SPLITTER
+# ============================================================
+
 def get_splitter():
+
     global _splitter
 
     if _splitter is None:
+
         _splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
@@ -76,35 +174,45 @@ def get_splitter():
     return _splitter
 
 
-def get_vectorstore():
-    global _vectorstore
-
-    if _vectorstore is None:
-        _vectorstore = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=get_embeddings(),
-            persist_directory=CHROMA_PATH,
-        )
-
-    return _vectorstore
-
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
 
 def normalize_text(text: str) -> str:
-    """
-    Clean extracted document text while preserving paragraph structure.
-    """
-    text = text.replace("\x00", " ")
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
 
-    # Remove excessive whitespace
-    text = re.sub(r"[ \t]+", " ", text)
+    text = text.replace(
+        "\x00",
+        " ",
+    )
 
-    # Keep paragraph boundaries
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.replace(
+        "\r\n",
+        "\n",
+    )
+
+    text = text.replace(
+        "\r",
+        "\n",
+    )
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
 
     return text.strip()
 
+
+# ============================================================
+# DOCUMENT ID
+# ============================================================
 
 def make_document_id(
     source: str,
@@ -112,10 +220,7 @@ def make_document_id(
     chunk_index: int,
     text: str,
 ) -> str:
-    """
-    Create a deterministic ID so repeated ingestion does not
-    continuously create duplicate chunks.
-    """
+
     raw = (
         f"{source}|"
         f"{page}|"
@@ -123,23 +228,35 @@ def make_document_id(
         f"{text}"
     )
 
-    return hashlib.sha256(
+    digest = hashlib.sha256(
         raw.encode("utf-8")
     ).hexdigest()
 
+    # Qdrant accepts UUID strings as point IDs.
+    # Convert deterministic SHA256 into UUID format.
+    return (
+        f"{digest[:8]}-"
+        f"{digest[8:12]}-"
+        f"{digest[12:16]}-"
+        f"{digest[16:20]}-"
+        f"{digest[20:32]}"
+    )
+
+
+# ============================================================
+# SPLIT DOCUMENTS
+# ============================================================
 
 def split_documents(
     documents: Iterable[Document],
 ) -> list[Document]:
-    """
-    Split large documents into smaller retrieval units while
-    preserving source/page metadata.
-    """
+
     splitter = get_splitter()
 
     chunks: list[Document] = []
 
     for document in documents:
+
         text = normalize_text(
             document.page_content
         )
@@ -157,11 +274,14 @@ def split_documents(
             None,
         )
 
-        split_texts = splitter.split_text(text)
+        split_texts = splitter.split_text(
+            text
+        )
 
         for chunk_index, chunk_text in enumerate(
             split_texts
         ):
+
             chunk_text = chunk_text.strip()
 
             if not chunk_text:
@@ -192,84 +312,153 @@ def split_documents(
     return chunks
 
 
+# ============================================================
+# ADD DOCUMENTS
+# ============================================================
+
 def add_documents(
     documents: list[Document],
-    batch_size: int = 16,
+    batch_size: int = 32,
 ) -> int:
-    """
-    Split and ingest documents into ChromaDB in batches.
 
-    Batch ingestion is important for large documents because
-    embedding thousands of chunks at once can consume excessive
-    memory.
-    """
     if not documents:
         return 0
 
-    chunks = split_documents(documents)
+    ensure_collection()
+
+    chunks = split_documents(
+        documents
+    )
 
     if not chunks:
         return 0
 
-    vectorstore = get_vectorstore()
+    embeddings = get_embeddings()
+    client = get_qdrant()
 
     total = len(chunks)
 
-    for start in range(0, total, batch_size):
+    for start in range(
+        0,
+        total,
+        batch_size,
+    ):
+
         batch = chunks[
             start:start + batch_size
         ]
 
-        ids = [
-            document.metadata["chunk_id"]
+        texts = [
+            document.page_content
             for document in batch
         ]
 
-        vectorstore.add_documents(
-            documents=batch,
-            ids=ids,
+        vectors = embeddings.embed_documents(
+            texts
+        )
+
+        points = []
+
+        for document, vector in zip(
+            batch,
+            vectors,
+        ):
+
+            points.append(
+                PointStruct(
+                    id=document.metadata[
+                        "chunk_id"
+                    ],
+                    vector=vector,
+                    payload={
+                        "text": document.page_content,
+                        **document.metadata,
+                    },
+                )
+            )
+
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=points,
         )
 
         print(
-            f"Indexed {min(start + batch_size, total)}"
+            f"Indexed "
+            f"{min(start + batch_size, total)}"
             f"/{total} chunks"
         )
 
     return total
 
 
+# ============================================================
+# RETRIEVE DOCUMENTS
+# ============================================================
+
 def retrieve_documents(
     query: str,
     k: int = DEFAULT_RETRIEVAL_K,
 ) -> list[Document]:
-    """
-    MMR retrieval gives the model relevant but diverse chunks,
-    reducing the chance that all retrieved chunks contain nearly
-    identical text.
-    """
-    vectorstore = get_vectorstore()
 
-    return vectorstore.max_marginal_relevance_search(
-        query,
-        k=k,
-        fetch_k=FETCH_K,
-        lambda_mult=0.65,
+    ensure_collection()
+
+    embeddings = get_embeddings()
+    client = get_qdrant()
+
+    query_vector = embeddings.embed_query(
+        query
     )
 
+    results = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        limit=k,
+        with_payload=True,
+    )
+
+    documents = []
+
+    for result in results.points:
+
+        payload = result.payload or {}
+
+        text = payload.get(
+            "text",
+            "",
+        )
+
+        metadata = {
+            key: value
+            for key, value in payload.items()
+            if key != "text"
+        }
+
+        documents.append(
+            Document(
+                page_content=text,
+                metadata=metadata,
+            )
+        )
+
+    return documents
+
+
+# ============================================================
+# RETRIEVE CONTEXT
+# ============================================================
 
 def retrieve_context(
     query: str,
     k: int = DEFAULT_RETRIEVAL_K,
 ) -> str:
-    """
-    Retrieve relevant chunks and format them for the LLM.
-    """
+
     documents = retrieve_documents(
         query,
         k=k,
     )
 
     if not documents:
+
         return (
             "No relevant AWS documentation "
             "was found."
@@ -281,6 +470,7 @@ def retrieve_context(
         documents,
         1,
     ):
+
         source = document.metadata.get(
             "source",
             "Unknown source",
@@ -302,14 +492,15 @@ def retrieve_context(
     return "\n\n---\n\n".join(parts)
 
 
+# ============================================================
+# RETRIEVED SOURCES
+# ============================================================
+
 def get_retrieved_sources(
     query: str,
     k: int = DEFAULT_RETRIEVAL_K,
 ) -> list[dict]:
-    """
-    Return source metadata separately so the API/frontend can
-    display citations.
-    """
+
     documents = retrieve_documents(
         query,
         k=k,
@@ -318,6 +509,7 @@ def get_retrieved_sources(
     sources = []
 
     for document in documents:
+
         sources.append(
             {
                 "source": document.metadata.get(
